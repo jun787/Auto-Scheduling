@@ -1,0 +1,535 @@
+
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>自動排班小系統 (A/C/O)</title>
+  <style>
+    body{font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial;
+         margin:24px; line-height:1.4}
+    h1{margin:0 0 8px 0}
+    .row{display:flex; gap:12px; align-items:center; flex-wrap: wrap;}
+    label{font-weight:600}
+    input[type="number"]{width:90px; padding:6px}
+    input[type="text"]{padding:6px}
+    button{padding:8px 14px; border-radius:10px; border:1px solid #ccc; cursor:pointer; background:#fff}
+    button.primary{background:#222; color:#fff; border-color:#222}
+    button:disabled{opacity:.5; cursor:not-allowed}
+    table{border-collapse:collapse; width:100%; margin-top:16px; table-layout:fixed}
+    th,td{border:1px solid #ddd; padding:6px; text-align:center; font-size:14px}
+    th.sticky{position:sticky; left:0; background:#fafafa; z-index:2}
+    td.sticky{position:sticky; left:0; background:#fff; z-index:1}
+    .controls{display:flex; gap:8px; align-items:center; flex-wrap: wrap}
+    .note{font-size:12px; color:#666}
+    .legend{display:flex; gap:12px; font-size:14px; margin:8px 0 16px}
+    .pill{display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid #ddd}
+    .warn{color:#b45309}
+    .error{color:#b91c1c; font-weight:700}
+    .ok{color:#0f766e; font-weight:700}
+    .grid{display:grid; grid-template-columns: 1fr auto; gap:12px; align-items:end}
+    .small{font-size:12px}
+    .right{ text-align:right }
+    .muted{opacity:.7}
+  </style>
+</head>
+<body>
+  <h1>自動排班小系統</h1>
+  <div class="legend">
+    <span class="pill">A = 早班</span>
+    <span class="pill">C = 晚班</span>
+    <span class="pill">O = 休假</span>
+  </div>
+  <div class="row">
+    <label>年份</label><input id="year" type="number" min="2000" max="2100"/>
+    <label>月份</label><input id="month" type="number" min="1" max="12"/>
+    <button class="primary" id="build">建立月曆</button>
+    <span class="note">先建立月曆，再新增人員與標記休假 (O)。</span>
+  </div>
+
+  <div class="row" style="margin-top:8px;">
+    <label>新增人員</label><input id="newName" type="text" placeholder="姓名"/>
+    <button id="addPerson">新增</button>
+    <span class="note">可重複新增，系統會自動擴充。</span>
+  </div>
+
+  <div class="controls" style="margin-top:8px;">
+    <button class="primary" id="autoAssign" disabled>自動排班</button>
+    <button id="clearAssign" disabled>清除 A/C</button>
+    <button id="exportXlsx" disabled>匯出 XLSX (Excel)</button>
+    <span class="note">規則：1) 每天至少一位 A 與一位 C； 2) 同一人不可 C→A； 3) 奇數人：A 比 C 多 1；偶數人：A 與 C 平均。</span>
+  </div>
+
+  <div id="issues" class="small muted" style="margin-top:8px;"></div>
+
+  <div id="tableWrap" style="overflow:auto; margin-top:12px;"></div>
+
+  <script>
+    const state = {
+      days: [], // [{date:'2025-10-01', dow: '三'}]
+      people: [], // [{name:'jun', shifts: ['','','O','A',...]}]
+      showIssues: false, // 只有按下「自動排班」後才顯示
+    };
+
+    const buildBtn = document.getElementById('build');
+    const addBtn = document.getElementById('addPerson');
+    const autoBtn = document.getElementById('autoAssign');
+    const clearBtn = document.getElementById('clearAssign');
+    const exportBtn = document.getElementById('exportXlsx');
+    const info = document.getElementById('issues');
+
+    function ymd(date) {
+      const y = date.getFullYear();
+      const m = String(date.getMonth()+1).padStart(2,'0');
+      const d = String(date.getDate()).padStart(2,'0');
+      return `${y}-${m}-${d}`;
+    }
+    function dowZh(d) {
+      return ['日','一','二','三','四','五','六'][d.getDay()];
+    }
+
+    buildBtn.addEventListener('click', () => {
+      const y = parseInt(document.getElementById('year').value, 10);
+      const m = parseInt(document.getElementById('month').value, 10);
+      if(!y || !m || m<1 || m>12){ alert('請輸入正確的年份與月份'); return; }
+      // build days of month
+      state.days = [];
+      const first = new Date(y, m-1, 1);
+      const last = new Date(y, m, 0);
+      for(let d=1; d<=last.getDate(); d++){
+        const dt = new Date(y, m-1, d);
+        state.days.push({date: ymd(dt), dow: dowZh(dt)});
+      }
+      // wipe people shifts to fit days length
+      state.people.forEach(p => {
+        p.shifts = Array(state.days.length).fill('');
+      });
+      state.showIssues = false; // 先不顯示任何覆蓋/違規提示
+      renderTable();
+      autoBtn.disabled = false;
+      clearBtn.disabled = false;
+      exportBtn.disabled = false;
+      logIssues();
+    });
+
+    addBtn.addEventListener('click', () => {
+      const name = document.getElementById('newName').value.trim();
+      if(!name){ alert('請輸入姓名'); return; }
+      if(state.days.length===0){ alert('請先建立月曆'); return; }
+      state.people.push({ name, shifts: Array(state.days.length).fill('') });
+      document.getElementById('newName').value='';
+      renderTable();
+      logIssues();
+    });
+
+    clearBtn.addEventListener('click', () => {
+      state.people.forEach(p => {
+        p.shifts = p.shifts.map(v => v==='O' ? 'O' : '');
+      });
+      renderTable();
+      logIssues();
+    });
+
+    function countPerPerson(p){
+      let a=0,c=0,o=0;
+      p.shifts.forEach(v => { if(v==='A')a++; else if(v==='C')c++; else if(v==='O')o++; });
+      return {A:a,C:c,O:o};
+    }
+
+    function updateRowStats(pi){
+      const p = state.people[pi];
+      const {A,C,O} = countPerPerson(p);
+      const td = document.getElementById(`stats-${pi}`);
+      if(td){ td.textContent = `A:${A}／C:${C}／O:${O}`; }
+    }
+
+    function prevShift(p, dayIdx){
+      if(dayIdx<=0) return '';
+      return p.shifts[dayIdx-1] || '';
+    }
+
+    function canAssign(p, dayIdx, shift){
+      const current = p.shifts[dayIdx];
+      if(current==='O') return false; // preset off
+      if(shift==='A' && prevShift(p, dayIdx)==='C') return false; // no C->A
+      return true;
+    }
+
+    function dayCoverage(dayIdx){
+      let A=0,C=0;
+      state.people.forEach(p => {
+        if(p.shifts[dayIdx]==='A') A++;
+        if(p.shifts[dayIdx]==='C') C++;
+      });
+      return {A,C};
+    }
+
+    function candidates(dayIdx){
+      return state.people.filter(p => p.shifts[dayIdx] !== 'O');
+    }
+
+    function autoAssign(){
+      if(state.days.length===0 || state.people.length===0){
+        alert('請先建立月曆並新增人員'); return;
+      }
+      // Reset all non-O cells
+      state.people.forEach(p => {
+        p.shifts = p.shifts.map(v => v==='O' ? 'O' : '');
+      });
+
+      // 按天分配，遵守奇偶規則與 C->A 禁止
+      for(let d=0; d<state.days.length; d++){
+        const cand = candidates(d);
+        const n = cand.length;
+        if(n===0) continue;
+        // 目標 A/C 數
+        const targetA = Math.ceil(n/2);
+        const targetC = Math.floor(n/2);
+
+        // 用於記錄當日已指派的人（避免重複）
+        const assigned = new Set();
+
+        function pickFor(shift, need){
+          let count=0;
+          for(let t=0; t<need; t++){
+            // 以最少該班別累積數優先，兼顧可指派性與尚未指派
+            const choices = cand
+              .filter(p => !assigned.has(p) && canAssign(p, d, shift))
+              .map(p => ({p, cnt: (shift==='A'? countPerPerson(p).A : countPerPerson(p).C)}))
+              .sort((x,y)=> x.cnt - y.cnt);
+            if(choices.length>0){
+              const pick = choices[0].p;
+              pick.shifts[d] = shift;
+              assigned.add(pick);
+              count++;
+            }
+          }
+          return count;
+        }
+
+        // 先指派 A（避免 C->A 違規影響 A 的可指派性）
+        let aDone = pickFor('A', targetA);
+        // 再指派 C
+        let cDone = pickFor('C', targetC);
+
+        // 若有未指派且仍有缺額，嘗試補位（例如因 C->A 限制導致 A 不足時）
+        if(aDone < targetA){
+          aDone += pickFor('A', targetA - aDone);
+        }
+        if(cDone < targetC){
+          cDone += pickFor('C', targetC - cDone);
+        }
+        // 若仍有未被指派（極端限制），保持空白，稍後在檢查中提示
+      }
+
+      state.showIssues = true; // 按下自動排班後才開始顯示提示
+      renderTable();
+      logIssues();
+    }
+
+    autoBtn.addEventListener('click', autoAssign);
+
+    function renderTable(){
+      const wrap = document.getElementById('tableWrap');
+      if(state.days.length===0){
+        wrap.innerHTML = '<div class="muted">尚未建立月曆。</div>';
+        info.innerHTML = '';
+        return;
+      }
+      // Build table
+      let html = '<table><thead><tr>';
+      html += '<th class="sticky">人員\\日期</th>';
+      state.days.forEach((d,idx)=>{
+        const parts = d.date.split('-');
+        html += `<th>${parts[2]}<div class="small muted">(${d.dow})</div></th>`;
+      });
+      html += '<th>總計</th>';
+      html += '</tr></thead><tbody>';
+
+      state.people.forEach((p,pi)=>{
+        html += `<tr><td class="sticky">${p.name}</td>`;
+        state.days.forEach((d,di)=>{
+          const val = p.shifts[di] || '';
+          html += `<td data-p="${pi}" data-d="${di}" contenteditable="true">${val}</td>`;
+        });
+        const cnt = countPerPerson(p);
+        html += `<td id="stats-${pi}" class="small">A:${cnt.A}／C:${cnt.C}／O:${cnt.O}</td>`;
+        html += `</tr>`;
+      });
+
+      // coverage row
+      html += `<tr><td class="sticky"><b>每日覆蓋</b></td>`;
+      state.days.forEach((d,di)=>{
+        const cov = dayCoverage(di);
+        const ok = (cov.A>=1 && cov.C>=1);
+        html += `<td class="${ok?'ok':'warn'} small">A:${cov.A} C:${cov.C}</td>`;
+      });
+      html += `<td></td></tr>`;
+
+      html += '</tbody></table>';
+      wrap.innerHTML = html;
+
+      // Add cell edit handler
+      wrap.querySelectorAll('td[contenteditable="true"]').forEach(td=>{
+        td.addEventListener('input', (e)=>{
+          const pi = parseInt(td.getAttribute('data-p'),10);
+          const di = parseInt(td.getAttribute('data-d'),10);
+          let v = td.textContent.trim().toUpperCase();
+          if(!['A','C','O',''].includes(v)){
+            td.textContent = ''; v='';
+          }
+          state.people[pi].shifts[di] = v;
+          updateRowStats(pi);  // 立即更新總計 (含 O 數)
+          if(state.showIssues){ logIssues(); } // 只有啟用時才顯示提示
+        });
+      });
+    }
+
+    function logIssues(){
+      if(!state.showIssues){ info.innerHTML = ''; return; }
+      const msgs = [];
+      if(state.people.length<2){
+        msgs.push('建議至少 2 位人員，否則無法保證每天同時有 A 與 C。');
+      }
+      // 規則檢查（以實際當日 A/C 計算人數）
+      state.days.forEach((d,di)=>{
+        const cov = dayCoverage(di);
+        const n = cov.A + cov.C;
+        if(n===0){
+          msgs.push(`【覆蓋不足】${d.date} 無人上班。`);
+          return;
+        }
+        if(n===1){
+          msgs.push(`【覆蓋不足】${d.date} 僅 1 人上班，需至少 A 與 C 各一人。`);
+        }
+        if(n>=2 && (cov.A<1 || cov.C<1)){
+          msgs.push(`【覆蓋不足】${d.date} 需要至少一位 A 與一位 C。`);
+        }
+        // 奇偶規則：奇數 => A = C+1；偶數 => A = C
+        if(n>=2){
+          if(n % 2 === 1){
+            if(!(cov.A === cov.C + 1)){
+              msgs.push(`【奇偶分配】${d.date} 上班 ${n} 人（奇數），A 應比 C 多 1，目前 A:${cov.A}, C:${cov.C}。`);
+            }
+          }else{
+            if(!(cov.A === cov.C)){
+              msgs.push(`【奇偶分配】${d.date} 上班 ${n} 人（偶數），A 與 C 應相等，目前 A:${cov.A}, C:${cov.C}。`);
+            }
+          }
+        }
+      });
+      // 2) 不可 C→A
+      state.people.forEach(p=>{
+        for(let i=1;i<state.days.length;i++){
+          if(p.shifts[i-1]==='C' && p.shifts[i]==='A'){
+            msgs.push(`【違規】${p.name} 在 ${state.days[i-1].date} 為 C，隔天 ${state.days[i].date} 不能排 A (C→A)。`);
+          }
+        }
+      });
+      // 3) 平衡提醒
+      state.people.forEach(p=>{
+        const cnt = countPerPerson(p);
+        if(Math.abs(cnt.A - cnt.C) > Math.ceil((cnt.A+cnt.C)*0.25)){
+          msgs.push(`【平衡提醒】${p.name} 的 A/C 可能不平均：A=${cnt.A}, C=${cnt.C}`);
+        }
+      });
+
+      info.innerHTML = msgs.length? msgs.map(m=>`<div>${m}</div>`).join('') : '<span class="ok">目前沒有明顯問題。</span>';
+    }
+
+    // ---------- XLSX 產生器（沿用上一版） ----------
+    const CRC32_TABLE = (()=>{
+      let c; const table = [];
+      for(let n=0;n<256;n++){
+        c = n;
+        for(let k=0;k<8;k++){
+          c = ((c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1));
+        }
+        table[n] = c >>> 0;
+      }
+      return table;
+    })();
+    function crc32(buf){
+      let crc = 0 ^ (-1);
+      for(let i=0;i<buf.length;i++){
+        crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ buf[i]) & 0xFF];
+      }
+      return (crc ^ (-1)) >>> 0;
+    }
+    function str2buf(str){ return new TextEncoder().encode(str); }
+    function zipFiles(files){
+      let fileData = []; let central = []; let offset = 0;
+      for(const f of files){
+        const crc = crc32(f.data);
+        const compSize = f.data.length;
+        const unCompSize = f.data.length;
+        const nameBuf = str2buf(f.name);
+        const localHeader = new Uint8Array(30 + nameBuf.length);
+        const view = new DataView(localHeader.buffer);
+        let p=0;
+        view.setUint32(p, 0x04034b50, true); p+=4;
+        view.setUint16(p, 20, true); p+=2;
+        view.setUint16(p, 0, true); p+=2;
+        view.setUint16(p, 0, true); p+=2;
+        view.setUint16(p, 0, true); p+=2;
+        view.setUint16(p, 0, true); p+=2;
+        view.setUint32(p, crc, true); p+=4;
+        view.setUint32(p, compSize, true); p+=4;
+        view.setUint32(p, unCompSize, true); p+=4;
+        view.setUint16(p, nameBuf.length, true); p+=2;
+        view.setUint16(p, 0, true); p+=2;
+        localHeader.set(nameBuf, 30);
+        const local = concatArrays([localHeader, f.data]);
+        fileData.push(local);
+
+        const centralHeader = new Uint8Array(46 + nameBuf.length);
+        const cv = new DataView(centralHeader.buffer);
+        p=0;
+        cv.setUint32(p, 0x02014b50, true); p+=4;
+        cv.setUint16(p, 20, true); p+=2;
+        cv.setUint16(p, 20, true); p+=2;
+        cv.setUint16(p, 0, true); p+=2;
+        cv.setUint16(p, 0, true); p+=2;
+        cv.setUint16(p, 0, true); p+=2;
+        cv.setUint16(p, 0, true); p+=2;
+        cv.setUint32(p, crc, true); p+=4;
+        cv.setUint32(p, compSize, true); p+=4;
+        cv.setUint32(p, unCompSize, true); p+=4;
+        cv.setUint16(p, nameBuf.length, true); p+=2;
+        cv.setUint16(p, 0, true); p+=2;
+        cv.setUint16(p, 0, true); p+=2;
+        cv.setUint16(p, 0, true); p+=2;
+        cv.setUint32(p, 0, true); p+=4;
+        cv.setUint32(p, offset, true); p+=4;
+        centralHeader.set(nameBuf, 46);
+        central.push(centralHeader);
+
+        offset += localHeader.length + f.data.length;
+      }
+      const centralDir = concatArrays(central);
+      const data = concatArrays(fileData);
+      const end = new Uint8Array(22);
+      const ev = new DataView(end.buffer);
+      ev.setUint32(0, 0x06054b50, true);
+      ev.setUint16(4, 0, true);
+      ev.setUint16(6, 0, true);
+      ev.setUint16(8, fileData.length, true);
+      ev.setUint16(10, fileData.length, true);
+      ev.setUint32(12, centralDir.length, true);
+      ev.setUint32(16, data.length, true);
+      ev.setUint16(20, 0, true);
+      const blob = new Blob([data, centralDir, end], {type: 'application/zip'});
+      return blob;
+    }
+    function concatArrays(arrs){
+      const total = arrs.reduce((s,a)=> s + a.length, 0);
+      const out = new Uint8Array(total);
+      let off=0;
+      for(const a of arrs){ out.set(a, off); off += a.length; }
+      return out;
+    }
+    function buildXlsxFromRows(rows, sheetName='Schedule'){
+      function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+      function colName(c){
+        let s=''; c++; while(c>0){ let m=(c-1)%26; s=String.fromCharCode(65+m)+s; c=Math.floor((c-1)/26); }
+        return s;
+      }
+      let sheet = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+      sheet += '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ';
+      sheet += 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">';
+      sheet += '<sheetData>';
+      for(let r=0;r<rows.length;r++){
+        sheet += `<row r="${r+1}">`;
+        for(let c=0;c<rows[r].length;c++){
+          const v = rows[r][c]==null? '' : String(rows[r][c]);
+          if(v === '') continue;
+          const a = `${colName(c)}${r+1}`;
+          if(!isNaN(v) && v.trim()!=='' && v.match(/^[-+]?\d+(\.\d+)?$/)){
+            sheet += `<c r="${a}"><v>${v}</v></c>`;
+          }else{
+            sheet += `<c r="${a}" t="inlineStr"><is><t>${esc(v)}</t></is></c>`;
+          }
+        }
+        sheet += '</row>';
+      }
+      sheet += '</sheetData></worksheet>';
+
+      const workbook = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <sheets>
+            <sheet name="${sheetName}" sheetId="1" r:id="rId1"/>
+          </sheets>
+        </workbook>`;
+
+      const rels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+        </Relationships>`;
+
+      const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+        </Relationships>`;
+
+      const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+          <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+          <Default Extension="xml" ContentType="application/xml"/>
+          <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+          <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+        </Types>`;
+
+      const files = [
+        {name: '[Content_Types].xml', data: str2buf(contentTypes)},
+        {name: '_rels/.rels', data: str2buf(rootRels)},
+        {name: 'xl/_rels/workbook.xml.rels', data: str2buf(rels)},
+        {name: 'xl/workbook.xml', data: str2buf(workbook)},
+        {name: 'xl/worksheets/sheet1.xml', data: str2buf(sheet)},
+      ];
+      return zipFiles(files);
+    }
+
+    function gatherRows(){
+      if(state.days.length===0 || state.people.length===0){
+        return [];
+      }
+      const rows = [];
+      const header = ['人員\\日期', ...state.days.map(d=>d.date), '總計'];
+      rows.push(header);
+      state.people.forEach((p,pi)=>{
+        const cnt = countPerPerson(p);
+        rows.push([p.name, ...p.shifts, `A:${cnt.A}／C:${cnt.C}／O:${cnt.O}`]);
+      });
+      const covRow = ['每日覆蓋', ...state.days.map((d,di)=>{
+        const cov = dayCoverage(di);
+        return `A:${cov.A};C:${cov.C}`;
+      }), ''];
+      rows.push(covRow);
+      return rows;
+    }
+
+    function exportXLSX(){
+      const rows = gatherRows();
+      if(rows.length===0){ alert('沒有資料可匯出'); return; }
+      const blob = buildXlsxFromRows(rows, 'Schedule');
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'auto_schedule.xlsx';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+    exportBtn.addEventListener('click', exportXLSX);
+
+    // 頁面載入：預填當月
+    (function init(){
+      const now = new Date();
+      document.getElementById('year').value = now.getFullYear();
+      document.getElementById('month').value = now.getMonth()+1;
+    })();
+  </script>
+</body>
+</html>
